@@ -1,115 +1,85 @@
 from pathlib import Path
-from src.utils.mongodb import get_database, get_regulation_id 
 from bson import ObjectId
+from src.utils.mongodb import get_database, get_regulation_id
 
 
-def full_text_search(search_text: str):
+class RegulationQueryService:
+    def __init__(self):
+        self.db = get_database()
+        self.entries = self.db['entries']
 
-    db = get_database()
-    collection_entries = db['entries']
+    def full_text_search(self, search_text: str):
+        query = {'content': {'$regex': search_text}}
+        results = self.entries.find(query)
+        return list(results)
 
-    query = {'content': {'$regex': search_text}}
-    results = collection_entries.find(query)
+    def context_entries_search(self, entry_id: str):
+        if isinstance(entry_id, str):
+            entry_id = ObjectId(entry_id)
 
-    return list(results)
-
-
-def context_entries_search(entry_id: str):
-    db = get_database()
-    collection_name = 'entries'
-    collection_entries = db[collection_name]
-
-    # ✅ 確保 _id 是 ObjectId 類型
-    if isinstance(entry_id, str):
-        entry_id = ObjectId(entry_id)
-
-    query_result = collection_entries.aggregate(
-        [
+        result = self.entries.aggregate([
             {'$match': {'_id': entry_id}},
             {
                 '$graphLookup': {
-                    'from': collection_name,
-                    'startWith': '$parent_id',  # ✅ 改為 parent_id
+                    'from': 'entries',
+                    'startWith': '$parent_id',
                     'connectFromField': 'parent_id',
                     'connectToField': '_id',
                     'as': 'ancestors',
-                    'depthField': 'ancestorLevel',
+                    'depthField': 'ancestorLevel'
                 }
             },
             {
                 '$graphLookup': {
-                    'from': collection_name,
+                    'from': 'entries',
                     'startWith': '$_id',
                     'connectFromField': '_id',
                     'connectToField': 'parent_id',
                     'as': 'descendants',
-                    'depthField': 'descendantLevel',
+                    'depthField': 'descendantLevel'
                 }
-            },
-        ]
-    )
+            }
+        ])
 
-    query_result = list(query_result)
-    if len(query_result) != 1:
-        raise ValueError(
-            f'Expected exactly one result to match the query, but found {len(query_result)}'
-        )
+        result = list(result)
+        if len(result) != 1:
+            raise ValueError(f'Expected 1 result, got {len(result)}')
+        return result[0]
 
-    return query_result[0]
+    def concate_ancestor_entries_content(self, entry_id: str):
+        data = self.context_entries_search(entry_id)
+        this_content = data['content']
+        ancestors = data['ancestors']
+        ancestors.sort(key=lambda x: x['ancestorLevel'], reverse=True)
+        result = ''.join([a['content'] + '\n' for a in ancestors])
+        result += this_content
+        return result
 
+    def concate_ancestor_entries_unit_number(self, entry_id: str):
+        data = self.context_entries_search(entry_id)
+        this_unit = data.get('unit_number', '')
+        ancestors = data['ancestors']
+        ancestors.sort(key=lambda x: x['ancestorLevel'], reverse=True)
+        units = [a.get('unit_number', '') for a in ancestors]
+        units.append(this_unit)
+        return ', '.join(units)
 
-def concate_ancestor_entries_content(entry_id: str):
-    context_entries = context_entries_search(entry_id)
-    this_entry_content = context_entries['content']
-    ancestor_entries = context_entries_search(entry_id)['ancestors']
+    def deduplicate_content_list(self, content_list: list):
+        content_list.sort(key=len)
+        for i, content in enumerate(content_list):
+            for j in range(i + 1, len(content_list)):
+                if content in content_list[j]:
+                    content_list[j] = ''
+        return [c for c in content_list if c]
 
-    result_content = ''
-    ancestor_entries.sort(key=lambda x: x['ancestorLevel'], reverse=True)
-    for ancestor in ancestor_entries:
-        result_content += ancestor['content'] + '\n'
-    result_content += this_entry_content
-    return result_content
-
-
-def concate_ancestor_entries_unit_number(entry_id: str):
-    context_entries = context_entries_search(entry_id)
-    this_entry_unit_number = context_entries['unit_number']
-    ancestor_entries = context_entries_search(entry_id)['ancestors']
-
-    result_unit_number = ''
-    ancestor_entries.sort(key=lambda x: x['ancestorLevel'], reverse=True)
-    for ancestor in ancestor_entries:
-        result_unit_number += ancestor['unit_number'] + ', '
-    result_unit_number += this_entry_unit_number
-    return result_unit_number
-
-
-def deduplicate_content_list(content_list: list):
-    """Deduplicates a list of content"""
-    content_list.sort(key=lambda x: len(x))
-    for i, content in enumerate(content_list):
-        for j in range(i + 1, len(content_list)):
-            if content in content_list[j]:
-                content_list[j] = ''
-    return [content for content in content_list if content]
-
-
-def save_regulation_entries(regulation_title, save_dir):
-    db = get_database()
-
-    save_dir_path: Path = Path(save_dir) / regulation_title
-    if not save_dir_path.exists():
-        save_dir_path.mkdir(parents=True, exist_ok=True)
-
-    collection = db['entries']
-
-    regulation_id = get_regulation_id(db, regulation_title)
-    query = {'regulation_id': regulation_id}
-    documents = collection.find(query)
-
-    for document in documents:
-        filename = document['content'].split('\n')[0].strip()
-        save_file_path = save_dir_path / filename
-        with open(save_file_path, 'w', encoding='utf-8') as f:
-            f.write(document['content'])
-
+    def save_regulation_entries(self, regulation_title: str, save_dir: str):
+        save_path = Path(save_dir) / regulation_title
+        save_path.mkdir(parents=True, exist_ok=True)
+        reg_id = get_regulation_id(self.db, regulation_title)
+        query = {'regulation_id': reg_id}
+        docs = self.entries.find(query)
+        for doc in docs:
+            filename = doc['content'].split('\n')[0].strip()
+            file_path = save_path / filename
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(doc['content'])
